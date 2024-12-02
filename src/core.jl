@@ -17,18 +17,30 @@ const CHECK_RESULTS = Ref(Vector{String}())
 const CHECK_LOCK = ReentrantLock()
 
 """
-    options(; vus::Int=1, iterations::Union{Int, Nothing}=nothing, duration::Union{Float64, Nothing}=nothing)
+    options(; vus::Int=1, format::String="default", max_vus::Union{Int, Nothing}=nothing, 
+              iterations::Union{Int, Nothing}=nothing, duration::Union{Float64, Nothing}=nothing)
 
 Configura opções globais para os testes de performance.
 
-- `vus`: Número de usuários virtuais (threads).
-- `iterations`: Número total de iterações a serem realizadas.
-- `duration`: Tempo máximo (em segundos) para a execução dos testes.
+# Parâmetros
+- `vus` (Int, padrão: 1): Número inicial de usuários virtuais (threads) que executarão as requisições simultaneamente.
+- `format` (String, padrão: "default"): Define o formato do teste. Opções disponíveis:
+  - `"default"`: Usa o número fixo de VUs especificado em `vus`.
+  - `"vus-ramping"`: Escala os VUs de forma incremental ao longo do tempo, começando em `vus` e aumentando até `max_vus`.
+- `max_vus` (Int ou `nothing`, padrão: `nothing`): Número máximo de VUs. Necessário se `format` for `"vus-ramping"`.
+- `iterations` (Int ou `nothing`, padrão: `nothing`): Número total de iterações a serem realizadas. Se `nothing`, o teste será controlado pelo parâmetro `duration`.
+- `duration` (Float64 ou `nothing`, padrão: `nothing`): Tempo máximo (em segundos) para a execução dos testes. Necessário se `format` for `"vus-ramping"`.
 """
-function options(; vus::Int=1, iterations::Union{Int, Nothing}=nothing, duration::Union{Float64, Nothing}=nothing)
+function options(; vus::Int=1, format::String="default", max_vus::Union{Int, Nothing}=nothing, iterations::Union{Int, Nothing}=nothing, duration::Union{Float64, Nothing}=nothing)
     GLOBAL_OPTIONS[:vus] = vus
+    GLOBAL_OPTIONS[:format] = format
+    GLOBAL_OPTIONS[:max_vus] = max_vus
     GLOBAL_OPTIONS[:iterations] = iterations
     GLOBAL_OPTIONS[:duration] = duration
+
+    if format == "vus-ramping" && (max_vus === nothing || duration === nothing)
+        error("Para o formato 'vus-ramping', você deve especificar 'max_vus' e 'duration'.")
+    end
 end
 
 """
@@ -211,6 +223,8 @@ Executa testes de performance com base nas requisições fornecidas.
 """
 function run_test(requests::Vararg{NamedTuple})
     vus = get(GLOBAL_OPTIONS, :vus, 1)
+    format = get(GLOBAL_OPTIONS, :format, "default")
+    max_vus = get(GLOBAL_OPTIONS, :max_vus, nothing)
     iterations = get(GLOBAL_OPTIONS, :iterations, nothing)
     duration = get(GLOBAL_OPTIONS, :duration, nothing)
 
@@ -218,36 +232,73 @@ function run_test(requests::Vararg{NamedTuple})
         error("Você deve especificar 'iterations' ou 'duration' nas opções globais.")
     end
 
-    num_threads = vus
-    local_results = [Float64[] for _ in 1:num_threads]
+    local_results = [Float64[] for _ in 1:vus]
     total_errors = Atomic{Int}(0)
-
     start_time = time()
-    stop_test = () -> duration !== nothing && (time() - start_time) >= duration
-
     tasks = []
-    for t in 1:num_threads
-        thread_id = t  
+
+    if format == "vus-ramping" && max_vus !== nothing && duration !== nothing
+        # Calcula o tempo entre aumentos de VUs
+        ramp_interval = duration / (max_vus - vus)
+
+        # Função para escalar os VUs dinamicamente
+        function ramp_vus()
+            current_vus = vus
+            while current_vus < max_vus && (time() - start_time) < duration
+                sleep(ramp_interval)
+                current_vus += 1
+                println("Escalando VUs para $current_vus")
+                push!(local_results, Float64[])
+
+                # Criar nova tarefa para o novo VU
+                thread_id = current_vus
+                push!(tasks, Threads.@spawn begin
+                    println("Thread $thread_id inicializada.")
+                    request_idx = 1
+                    i = 0
+                    while (iterations === nothing || i < iterations) && (time() - start_time) < duration
+                        try
+                            elapsed_time = @elapsed begin
+                                perform_request(requests[request_idx])
+                            end
+                            push!(local_results[thread_id], elapsed_time)
+
+                            method_name = string(requests[request_idx].method) |> x -> split(x, ".")[end]
+                            println("Requisição (Método: $method_name) finalizada no thread $thread_id (Tempo: $elapsed_time segundos)")
+                        catch e
+                            atomic_add!(total_errors, 1)
+                            println("Erro na requisição no thread $thread_id: ", e)
+                        end
+
+                        request_idx = (request_idx % length(requests)) + 1
+                        i += 1
+                    end
+                end)
+            end
+        end
+
+        # Iniciar o thread para escalar os VUs
+        Threads.@spawn ramp_vus()
+    end
+
+    # Criar tarefas iniciais para os VUs iniciais
+    for t in 1:vus
         push!(tasks, Threads.@spawn begin
-            println("Thread $thread_id inicializada.")
+            println("Thread $t inicializada.")
             request_idx = 1
-
             i = 0
-            while (iterations === nothing || i < iterations) && !stop_test()
-                global_iter = iterations === nothing ? i + 1 : i + 1
-                current_request = requests[request_idx]
-
+            while (iterations === nothing || i < iterations) && (time() - start_time) < duration
                 try
                     elapsed_time = @elapsed begin
-                        perform_request(current_request)
+                        perform_request(requests[request_idx])
                     end
-                    push!(local_results[thread_id], elapsed_time)
-                    
-                    method_name = string(current_request.method) |> x -> split(x, ".")[end]
-                    println("Requisição $global_iter (Método: $method_name) finalizada no thread $thread_id (Tempo: $elapsed_time segundos)")
+                    push!(local_results[t], elapsed_time)
+
+                    method_name = string(requests[request_idx].method) |> x -> split(x, ".")[end]
+                    println("Requisição (Método: $method_name) finalizada no thread $t (Tempo: $elapsed_time segundos)")
                 catch e
                     atomic_add!(total_errors, 1)
-                    println("Erro na requisição $global_iter no thread $thread_id: ", e)
+                    println("Erro na requisição no thread $t: ", e)
                 end
 
                 request_idx = (request_idx % length(requests)) + 1
